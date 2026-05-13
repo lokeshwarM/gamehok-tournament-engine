@@ -1,75 +1,109 @@
 package com.gamehok.tournament.scheduler;
 
-import com.gamehok.tournament.orchestration.service.TournamentOrchestrationService;
-import com.gamehok.tournament.matchmaking.repository.MatchmakingQueueRepository;
+import com.gamehok.tournament.enums.TournamentStatus;
+import com.gamehok.tournament.orchestration.lifecycle.TournamentLifecycleStateMachine;
+import com.gamehok.tournament.tournament.entity.Tournament;
 import com.gamehok.tournament.tournament.repository.TournamentRepository;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import java.time.Instant;
+import java.util.List;
 
 /**
- * Scheduled task executor for automated tournament lifecycle management.
- * <p>
- * Runs periodic jobs to:
- * - Open registration for DRAFT tournaments whose registration start time has passed
- * - Close registration for REGISTRATION_OPEN tournaments past their deadline
- * - Start IN_PROGRESS tournaments at their scheduled start time
- * - Process matchmaking queue cycles
- * - Handle match result timeouts
- * <p>
- * All jobs are idempotent and safe to re-run.
- * </p>
+ * Scheduled lifecycle driver for automated tournament state transitions.
+ *
+ * <p>All transitions are initiated through the {@link TournamentLifecycleStateMachine},
+ * ensuring guards and handlers run correctly even for time-driven transitions.
+ *
+ * <p>All jobs are idempotent — safe to re-run, and guarded against double-execution
+ * by the state machine's structural transition validation.
+ *
+ * <h3>Scheduled jobs:</h3>
+ * <ul>
+ *   <li>Every 60s: Open registration for DRAFT tournaments whose window has started</li>
+ *   <li>Every 60s: Close registration for REGISTRATION_OPEN tournaments past T-2h</li>
+ *   <li>Every 60s: Begin check-in for REGISTRATION_CLOSED tournaments</li>
+ *   <li>Every 60s: Trigger seeding for CHECK_IN tournaments past their check-in window</li>
+ *   <li>Every 15s: Matchmaking queue cycle</li>
+ * </ul>
  */
 @Slf4j
 @Component
 public class TournamentScheduler {
 
     private final TournamentRepository tournamentRepository;
-    private final TournamentOrchestrationService orchestrationService;
+    private final TournamentLifecycleStateMachine stateMachine;
 
     public TournamentScheduler(
             TournamentRepository tournamentRepository,
-            TournamentOrchestrationService orchestrationService
+            TournamentLifecycleStateMachine stateMachine
     ) {
         this.tournamentRepository = tournamentRepository;
-        this.orchestrationService = orchestrationService;
+        this.stateMachine = stateMachine;
     }
 
     /**
-     * Checks every minute for tournaments that should open registration.
+     * Opens registration for DRAFT tournaments whose registrationStart has passed.
+     * Runs every 60 seconds.
      */
     @Scheduled(fixedDelay = 60_000)
     public void openRegistrationForDueTournaments() {
         Instant now = Instant.now();
-        tournamentRepository.findTournamentsReadyToOpenRegistration(now).forEach(t -> {
-            log.info("[SCHEDULER] Opening registration for tournament: {} ({})", t.getName(), t.getUuid());
-            // status transition delegated to orchestration/service
-        });
+        List<Tournament> due = tournamentRepository.findTournamentsReadyToOpenRegistration(now);
+
+        for (Tournament t : due) {
+            tryTransition(t, TournamentStatus.REGISTRATION_OPEN,
+                    "Scheduled: registration window opened");
+        }
     }
 
     /**
-     * Checks every minute for tournaments that should close registration.
+     * Closes registration for tournaments whose registrationEnd (= startTime - 2h) has passed.
+     * Runs every 60 seconds.
      */
     @Scheduled(fixedDelay = 60_000)
     public void closeExpiredRegistrations() {
         Instant now = Instant.now();
-        tournamentRepository.findExpiredRegistrations(now).forEach(t -> {
-            log.info("[SCHEDULER] Closing registration for tournament: {} ({})", t.getName(), t.getUuid());
-        });
+        List<Tournament> expired = tournamentRepository.findExpiredRegistrations(now);
+
+        for (Tournament t : expired) {
+            tryTransition(t, TournamentStatus.REGISTRATION_CLOSED,
+                    "Scheduled: registration window expired (T-2h rule)");
+        }
     }
 
     /**
-     * Checks every minute for tournaments ready to start.
+     * Transitions REGISTRATION_CLOSED tournaments to SEEDING when all validations pass.
+     * If a tournament has a check-in phase configured, it goes to CHECK_IN instead.
+     * Runs every 60 seconds.
      */
     @Scheduled(fixedDelay = 60_000)
-    public void startDueTournaments() {
+    public void advanceRegistrationClosedTournaments() {
+        List<Tournament> closed = tournamentRepository.findRegistrationClosedTournaments();
+
+        for (Tournament t : closed) {
+            boolean hasCheckIn = t.getCheckInStart() != null && t.getCheckInEnd() != null;
+            TournamentStatus next = hasCheckIn ? TournamentStatus.CHECK_IN : TournamentStatus.SEEDING;
+
+            tryTransition(t, next,
+                    "Scheduled: advancing from REGISTRATION_CLOSED to " + next);
+        }
+    }
+
+    /**
+     * Triggers seeding for CHECK_IN tournaments whose check-in window has closed.
+     * Runs every 60 seconds.
+     */
+    @Scheduled(fixedDelay = 60_000)
+    public void triggerSeedingForCompletedCheckIn() {
         Instant now = Instant.now();
-        tournamentRepository.findTournamentsReadyToStart(now).forEach(t -> {
-            log.info("[SCHEDULER] Starting tournament: {} ({})", t.getName(), t.getUuid());
-            orchestrationService.seedAndGenerateBracket(t.getUuid());
-        });
+        tournamentRepository.findAll().stream()
+                .filter(t -> t.getStatus() == TournamentStatus.CHECK_IN)
+                .filter(t -> t.getCheckInEnd() != null && now.isAfter(t.getCheckInEnd()))
+                .forEach(t -> tryTransition(t, TournamentStatus.SEEDING,
+                        "Scheduled: check-in window closed, proceeding to seeding"));
     }
 
     /**
@@ -77,7 +111,20 @@ public class TournamentScheduler {
      */
     @Scheduled(fixedDelay = 15_000)
     public void processMatchmakingQueue() {
-        log.debug("[SCHEDULER] Processing matchmaking queue cycle");
-        // Delegated to MatchmakingService
+        log.debug("[SCHEDULER] Matchmaking queue cycle tick");
+        // Delegated to MatchmakingService (injected separately to avoid circular dependencies)
+    }
+
+    /**
+     * Safely executes a lifecycle transition, logging but not propagating exceptions.
+     * Guards will reject invalid transitions; this ensures partial failures don't crash the scheduler.
+     */
+    private void tryTransition(Tournament tournament, TournamentStatus target, String reason) {
+        try {
+            stateMachine.systemTransition(tournament.getUuid(), target, reason);
+        } catch (Exception ex) {
+            log.warn("[SCHEDULER] Transition {} → {} skipped for tournament {}: {}",
+                    tournament.getStatus(), target, tournament.getUuid(), ex.getMessage());
+        }
     }
 }

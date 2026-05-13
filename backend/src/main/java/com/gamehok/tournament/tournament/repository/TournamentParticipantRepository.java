@@ -32,4 +32,14 @@ public interface TournamentParticipantRepository extends JpaRepository<Tournamen
     boolean existsByTournamentIdAndUserId(Long tournamentId, Long userId);
 
     boolean existsByTournamentIdAndTeamId(Long tournamentId, Long teamId);
+
+    /**
+     * Finds all participants for a tournament with a specific status.
+     * Used by the seeding pipeline to load only eligible (REGISTERED / CHECKED_IN) participants.
+     */
+    @Query("SELECT p FROM TournamentParticipant p WHERE p.tournament.id = :tournamentId AND p.status = :status")
+    List<TournamentParticipant> findByTournamentIdAndStatus(
+            @Param("tournamentId") Long tournamentId,
+            @Param("status") ParticipantStatus status
+    );
 }

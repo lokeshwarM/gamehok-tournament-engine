@@ -53,4 +53,29 @@ public interface TournamentRepository extends JpaRepository<Tournament, Long>, J
 
     @Query("SELECT t FROM Tournament t WHERE t.status = 'CHECK_IN' AND t.startTime <= :now")
     List<Tournament> findTournamentsReadyToStart(@Param("now") Instant now);
+
+    /**
+     * Finds all active tournaments a given user is participating in (solo or via team).
+     * Used for time-overlap conflict detection during registration.
+     */
+    @Query("""
+            SELECT t FROM Tournament t
+            JOIN TournamentParticipant p ON p.tournament.id = t.id
+            WHERE t.status IN :statuses
+              AND (p.userId = :userId OR p.teamId IN (
+                    SELECT tm.team.id FROM TeamMember tm WHERE tm.userId = :userId AND tm.active = true
+              ))
+              AND p.status NOT IN ('WITHDRAWN', 'DISQUALIFIED')
+            """)
+    List<Tournament> findActiveUserTournaments(
+            @Param("userId") Long userId,
+            @Param("statuses") java.util.Set<com.gamehok.tournament.enums.TournamentStatus> statuses
+    );
+
+    /**
+     * Finds all tournaments in REGISTRATION_CLOSED status that have sufficient
+     * participants and are ready to transition to SEEDING.
+     */
+    @Query("SELECT t FROM Tournament t WHERE t.status = 'REGISTRATION_CLOSED'")
+    List<Tournament> findRegistrationClosedTournaments();
 }

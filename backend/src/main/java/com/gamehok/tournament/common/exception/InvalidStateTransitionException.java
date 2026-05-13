@@ -20,4 +20,11 @@ public class InvalidStateTransitionException extends TournamentEngineException {
                 String.format("Cannot transition %s from '%s' to '%s'", entity, fromState, toState)
         );
     }
+
+    /**
+     * Convenience constructor for guard-level violations where a descriptive message is sufficient.
+     */
+    public InvalidStateTransitionException(String message) {
+        super(HttpStatus.CONFLICT, "INVALID_STATE_TRANSITION", message);
+    }
 }
